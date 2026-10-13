@@ -10,7 +10,7 @@ mkdir -p "$BUILD"
 # This commit has to be one that carries AmmServer_StartAPI / API mode ( src/AmmServerlib/threads/
 # epollAPIServer.c ) - without it the link below fails with an undefined reference to AmmServer_StartAPI.
 AMMARSERVER_REPO="https://github.com/AmmarkoV/AmmarServer.git"
-AMMARSERVER_COMMIT="13818ab5aee7a15f1f9c76b9e099e35393a4b337"
+AMMARSERVER_COMMIT="b72898c19b2ec4f1024a5691cdb1d7369896bae6"
 
 # SQLite, built from the amalgamation rather than taken from apt: it pins the version the benchmark runs
 # against, and it is the only way to get the compile-time options below ( most of all THREADSAFE=0 ).
@@ -85,30 +85,39 @@ fi
 # USE_ALLOCA          : small scratch allocations go on the stack
 # DEFAULT_WAL_SYNCHRONOUS=1 : NORMAL in WAL mode by default, which is what challenge rule 6 asks for and
 #                       what main() sets explicitly anyway
-if [ ! -f "$BUILD/sqlite3.o" ] || [ "$SQLITE/sqlite3.c" -nt "$BUILD/sqlite3.o" ]; then
+SQLITE_CFLAGS=(
+  -O2 -DNDEBUG -march=native -mtune=native
+  -DSQLITE_THREADSAFE=0
+  -DSQLITE_DEFAULT_MEMSTATUS=0
+  -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1
+  -DSQLITE_OMIT_AUTOINIT
+  -DSQLITE_OMIT_DEPRECATED
+  -DSQLITE_OMIT_LOAD_EXTENSION
+  -DSQLITE_OMIT_PROGRESS_CALLBACK
+  -DSQLITE_OMIT_SHARED_CACHE
+  -DSQLITE_LIKE_DOESNT_MATCH_BLOBS
+  -DSQLITE_MAX_EXPR_DEPTH=0
+  -DSQLITE_DQS=0
+  -DSQLITE_USE_ALLOCA
+  -DSQLITE_TRUSTED_SCHEMA=0
+)
+
+# Recompiled when the source changes *or the flags do* : an object built with different flags is as stale as
+# one built from different source, and sqlite3.o is the one thing here expensive enough to want to cache.
+if [ ! -f "$BUILD/sqlite3.o" ] || \
+   [ "$SQLITE/sqlite3.c" -nt "$BUILD/sqlite3.o" ] || \
+   [ "${SQLITE_CFLAGS[*]}" != "$(cat "$BUILD/sqlite3.flags" 2>/dev/null)" ]; then
   echo "== compiling sqlite3.c"
-  cc -c -O2 -DNDEBUG \
-     -DSQLITE_THREADSAFE=0 \
-     -DSQLITE_DEFAULT_MEMSTATUS=0 \
-     -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 \
-     -DSQLITE_OMIT_AUTOINIT \
-     -DSQLITE_OMIT_DEPRECATED \
-     -DSQLITE_OMIT_LOAD_EXTENSION \
-     -DSQLITE_OMIT_PROGRESS_CALLBACK \
-     -DSQLITE_OMIT_SHARED_CACHE \
-     -DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
-     -DSQLITE_MAX_EXPR_DEPTH=0 \
-     -DSQLITE_DQS=0 \
-     -DSQLITE_USE_ALLOCA \
-     -DSQLITE_TRUSTED_SCHEMA=0 \
-     -o "$BUILD/sqlite3.o" "$SQLITE/sqlite3.c"
+  cc -c "${SQLITE_CFLAGS[@]}" -o "$BUILD/sqlite3.o" "$SQLITE/sqlite3.c"
+  printf '%s' "${SQLITE_CFLAGS[*]}" > "$BUILD/sqlite3.flags"
 fi
 
 # ---------------------------------------------------------------- the API itself
-# No -march=native on purpose : a couple of percent is not worth a SIGILL taking out a whole benchmark run
-# if the host's instruction set is ever not what it was at build time.
+# -march=native : everything here is compiled from source on the machine that will run it, so the binary is
+# built for that exact CPU. It does mean the binary is only valid on the host that built it - if the
+# instruction set under it ever changed, this would be a SIGILL rather than a slow server.
 echo "== feedapi"
-cc -O2 -DNDEBUG -Wall \
+cc -O2 -DNDEBUG -Wall -march=native -mtune=native \
    -I"$SQLITE" \
    -I"$AMMARSERVER/src/AmmServerlib" \
    -o "$BUILD/feedapi" \

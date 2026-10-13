@@ -148,8 +148,16 @@ commit is an append to the WAL with no fsync. Batching 90 commits/s into ~10 sav
 percent of one vCPU, and costs a response that must be held back after its handler returns and failed
 in a batch if the commit fails. Not worth getting wrong. One commit per write request.
 
-**`-march=native`.** A couple of percent is not worth a `SIGILL` taking out a whole benchmark run if
-the host's instruction set is ever not what it was at build time.
+### A note on `-march=native`
+
+Both the amalgamation and the API are compiled `-march=native -mtune=native`. Everything is built from
+source on the machine that runs it, so the binary is tuned for that exact CPU. In my own measurements
+it made no difference worth reporting — building `GET /feed` took 24.3 / 24.7 / 25.4 µs without it and
+24.2 / 24.7 / 25.0 µs with it across three runs, which is inside the run-to-run noise, because SQLite's
+hot path is pointer chasing and byte comparison rather than anything a wider register helps with. It
+may do better on a different core than mine. The cost is that the binary is only valid on the host that
+built it: if the instruction set underneath it ever changed, that would be a `SIGILL` rather than a slow
+server.
 
 ## Rule notes
 
