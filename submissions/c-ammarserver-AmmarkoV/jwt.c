@@ -1,6 +1,5 @@
 /* HS256 bearer token verification. See jwt.h . */
 #include <string.h>
-#include <strings.h>
 #include <stdlib.h>
 
 #include <openssl/hmac.h>
@@ -144,9 +143,9 @@ static int JsonValueToLongLong(const char * value,unsigned int valueLength,long 
   return 1;
 }
 
-enum JwtResult JwtVerifyBearer(
-                                const char * authHeader,
-                                unsigned int authHeaderLength,
+enum JwtResult JwtVerifyToken(
+                                const char * token,
+                                unsigned int tokenLength,
                                 const char * secret,
                                 unsigned int secretLength,
                                 long long now,
@@ -155,12 +154,7 @@ enum JwtResult JwtVerifyBearer(
                                 unsigned int scratchSize
                               )
 {
-  if ( (authHeader==0) || (authHeaderLength<7) || (strncasecmp(authHeader,"Bearer ",7)!=0) ) { return JWT_NO_BEARER; }
-
-  const char * token = authHeader+7;
-  unsigned int tokenLength = authHeaderLength-7;
-  while ( (tokenLength>0) && (*token==' ') ) { ++token; --tokenLength; }
-  if (tokenLength==0) { return JWT_INVALID; }
+  if ( (token==0) || (tokenLength==0) ) { return JWT_INVALID; }
 
   /* header.payload.signature */
   const char * firstDot = (const char *) memchr(token,'.',tokenLength);

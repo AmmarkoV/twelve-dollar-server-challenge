@@ -4,12 +4,13 @@
 #ifndef FEEDAPI_JWT_H_INCLUDED
 #define FEEDAPI_JWT_H_INCLUDED
 
-/* Mapped one-to-one onto the three distinct 401 messages the spec asks for, which is why "the token is
- * structurally broken" and "the token is fine but its claims are not" are separate results. */
+/* Mapped onto the 401 messages the spec asks for, which is why "the token is structurally broken" and
+ * "the token is fine but its claims are not" are separate results. Finding the token in the request is
+ * not this file's job - AmmServer_APIRequestBearer does that - so "there was no token" is not a result
+ * here either. */
 enum JwtResult
 {
    JWT_OK = 0,
-   JWT_NO_BEARER,     /* no Authorization header, or it does not start with "Bearer " */
    JWT_INVALID,       /* malformed, not HS256, bad signature, or expired */
    JWT_BAD_PAYLOAD    /* signature and exp are good, but sub/username are not what they must be */
 };
@@ -22,14 +23,14 @@ struct JwtClaims
 };
 
 /**
- * Verify an Authorization header value and pull out the claims the API needs.
- * authHeader/authHeaderLength is the raw header value ( pass 0 when the request had no such header ).
+ * Verify a bearer token and pull out the claims the API needs. The token is what
+ * AmmServer_APIRequestBearer returned, so it is not NUL terminated and the length is not optional.
  * scratch holds the decoded payload that claims->username points into, so it has to stay alive and
  * untouched for as long as the claims are used.
  */
-enum JwtResult JwtVerifyBearer(
-                                const char * authHeader,
-                                unsigned int authHeaderLength,
+enum JwtResult JwtVerifyToken(
+                                const char * token,
+                                unsigned int tokenLength,
                                 const char * secret,
                                 unsigned int secretLength,
                                 long long now,

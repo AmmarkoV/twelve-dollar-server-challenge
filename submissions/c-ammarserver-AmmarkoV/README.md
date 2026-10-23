@@ -7,6 +7,7 @@
 | **SQLite** | 3.53.0, built from the official amalgamation ( pinned URL + sha256 in `build.sh` ) and linked in, not the apt package |
 | **Crypto** | OpenSSL `libcrypto` ( `HMAC`, `CRYPTO_memcmp` ) for HS256 |
 | **Nginx or direct** | **Direct**, `0.0.0.0:80`. No Nginx |
+| **Transport** | `io_uring`, 4 rings, every connection a *direct descriptor* — so `LimitNOFILE=65535` is no longer the connection ceiling. `IO_URING=0` serves from the epoll event loop instead, which is also where it lands by itself on a kernel older than 5.19 |
 | **Threads** | 3, at any load: one event loop serving every connection, one acceptor, one idle `main` |
 
 ## Why direct, and what had to change to make it possible
@@ -22,11 +23,18 @@ measured ~3x faster than handing connections back to epoll between requests when
 cached file at 138k req/s. It is the wrong design here: 15,000 mostly-idle connections would mean 15,000
 threads, which 2 GB does not buy.
 
-So this submission adds **API mode** to AmmarServer ( `AmmServer_StartAPI`, `src/AmmServerlib/threads/
-epollAPIServer.c` ): one non-blocking epoll event loop owns every connection from `accept` to `close`,
-and answers each request from a single C callback that returns its own status code, content type and
-body. An idle keep-alive connection costs an fd and a ~64 byte struct instead of a thread. The epoll
+So this submission adds **API mode** to AmmarServer: one event loop owns every connection from `accept`
+to `close`, and answers each request from a single C callback that returns its own status code, content
+type and body. An idle keep-alive connection costs a ~32 byte struct instead of a thread. The event loop
 round trip per request that was too expensive at 138k req/s is irrelevant at 1,000 req/s.
+
+API mode has two transports under the same callback, same SQLite and same three threads, so that they
+are comparable: an epoll event loop ( `src/AmmServerlib/threads/epollAPIServer.c` ) and an `io_uring`
+one ( `uringAPIServer.c` ), with the HTTP/1.1 framing they share factored out into `apiProtocol.c`.
+**The ring is what ships**, because an epoll connection costs a file descriptor and a ring connection
+does not — see the ceiling section — and because it measured faster at every concurrency tried: ~6%
+more throughput and ~6% less CPU per request from 50 connections up, with a tail a third shorter. It
+falls back to epoll, with a line saying so, if the kernel will not give it a ring.
 
 Going direct then costs nothing and saves the 14–20% of the single vCPU that Nginx was taking, and
 there is no second process holding 15,000 sockets' worth of buffers.
@@ -36,24 +44,36 @@ there is no second process holding 15,000 sockets' worth of buffers.
 On my own machine, not the benchmark droplet, so read these as ratios and not as scores — a droplet
 vCPU is slower, and here k6 shares the CPU with the server:
 
+All of these were taken with the process's descriptor limit set to the droplet's `65535`, on what the
+submission ships ( 4 rings ):
+
 | | |
 |---|---|
-| 15,000 idle keep-alive connections | 3 threads, **7.0 MB RSS**, **0 CPU ticks over 12 s** ( no busy loop ) |
-| **70,000** idle keep-alive connections | 3 threads, **10.4 MB RSS**, **0 CPU ticks over a 60 s hold**, 70,008 fds. Opened in 4.0 s, all 70,000 answered byte-correct |
-| `GET /feed`, existing keep-alive connection | avg **54 µs**, p99 94 µs idle — **65 µs** with 15,000 open, **74 µs** with 70,000 open |
-| New connection accepted + adopted | ~67 µs of CPU |
+| **70,000** idle keep-alive connections | 3 threads, **17.4 MB RSS**, **0 CPU ticks over a 60 s hold**, and **16 file descriptors** — the connections are not descriptors. Opened in 3.3 s, every one of the 70,000 answered byte-correct, then all 70,000 answered again after the hold |
+| `GET /feed`, existing keep-alive connection | avg **50 µs**, p50 48 µs, p99 65 µs idle — avg **59 µs** with 70,000 connections open |
+| `GET /health` / `GET /posts/:id`, same | avg **21 µs** / **22 µs** |
+| `POST /posts` sustained, one connection | **~5,500 writes/s**, p50 **88 µs**, p99 186 µs, worst 96 ms ( one WAL checkpoint ). Repeated runs vary by ±10% either way, and it is the WAL doing the varying, so read this as the order of magnitude it is |
+| `GET /feed` at 500 concurrent connections | **29,533 req/s** at 100% of one core, 33.9 µs of CPU per request |
 | k6, 2,000 VUs | p95 **300 µs**, p99 **401 µs**, 0.00% errors, 27,064/27,064 checks |
 | k6, 10,000 VUs | p95 **293 µs**, p99 **4.7 ms**, 0.00% errors, 183,547/183,547 checks, ~6% of one core |
 
 Per-request cost barely moving between 0 and 70,000 open connections is the property the whole design
 rests on, so it is the one worth checking first on the droplet.
 
+The two k6 rows were measured on the epoll transport, when that was what shipped, and I have not re-run
+them since — so read them as a floor rather than a figure: the ring was faster than epoll at every
+concurrency I measured afterwards. Everything else in the table is the ring as shipped.
+
 ### Where the ceiling actually is
 
-Serving direct means one descriptor per connected user, so **`LimitNOFILE=65535` is the connection
-limit and therefore the score ceiling**: ~65,527 connections once this process's own handful of
-descriptors are counted. Rule 11 says nothing on the box gets tuned, so that limit is taken as given —
-what this submission does is make sure all of it is usable:
+Serving direct used to mean one descriptor per connected user, which made **`LimitNOFILE=65535` the
+connection limit and therefore the score ceiling**: ~65,527 connections once this process's own handful
+of descriptors are counted. That is measured, exactly, and it is what the epoll transport still does —
+`IO_URING=0` stops at **connection 65,527** and refuses the next one. Rule 11 says nothing on the box
+gets tuned, so the limit itself is taken as given. Two things follow from it: all of it has to be
+usable, and then it has to stop being the ceiling.
+
+Making all of it usable:
 
 - The process raises its own `RLIMIT_NOFILE` soft limit to the hard limit at startup and prints both.
   A default shell hands out a soft limit of 1024 against a far higher hard limit, and nothing would
@@ -66,23 +86,66 @@ what this submission does is make sure all of it is usable:
   being served. Instead it backs off 50 ms and logs at most one line a second. Measured by running a
   server with `ulimit -n 2048` and throwing 3,000 connections at it: **1 CPU tick over 10 s** while
   saturated, and the connections it did accept kept being served.
-- Kernel memory is not the constraint: ~3 KB of unreclaimable slab per connection, so ~200 MB at
-  65,000 — against 2 GB that also holds a 10 MB server process and a 238 MB database it reads through
-  `mmap`.
+- Kernel memory is not the constraint at that scale: ~3 KB of unreclaimable slab per connection, so
+  ~200 MB at 65,000 — against 2 GB that also holds a ~17 MB server process and a 238 MB database it
+  reads through `mmap`.
 
-70,000 connections were held on one process in testing, so nothing in the server gives out before the
-descriptor limit does.
+And then not being bounded by it at all, which is what the `io_uring` transport is for. There are two
+ways past 65,535 and this takes the second. Several processes behind `SO_REUSEPORT` each get their own
+descriptor budget, which rule 1 permits, at the cost of a second SQLite writer and WAL contention
+between them. Or one process stops spending descriptors: a multishot accept with
+`IORING_FILE_INDEX_ALLOC` installs each new socket straight into the ring's own registered file table,
+giving a **direct descriptor** — an index into that table rather than an entry in the process descriptor
+table. `RLIMIT_NOFILE` is never charged for it, and the size of the table becomes the bound instead.
 
-Going past 65,535 would need several processes behind `SO_REUSEPORT`, which rule 1 permits. This
-submission does not, because the other end runs out first. A connection is identified by its
+A table is where the multiplier comes from. It may be *declared* no larger than `RLIMIT_NOFILE`, but
+the kernel checks that once, at registration, and never again — so N tables are N times the connections
+from the same limit, in one process, on one thread, with one SQLite writer. That is why this ships four
+rings: **262,140 connection slots under `LimitNOFILE=65535`**. They fill one at a time, so the second
+ring costs nothing until the first is full, and an idle ring costs one syscall a second.
+
+Measured, with the server's hard limit lowered to 1024 so the whole ladder fits on one machine, every
+connection checked answered:
+
+| transport | connections held under a 1024 limit |
+|---|---|
+| epoll | 1,016 |
+| `io_uring`, 1 ring | 1,024 — the whole limit, since the listener, the rings, the database and stdio no longer compete with connections for it |
+| `io_uring`, 2 rings | **2,048** |
+| `io_uring`, 4 rings | **4,096** |
+
+And at the droplet's own limit: with `RLIMIT_NOFILE` at 65,535, **70,000 concurrent connections were
+opened, answered, held for a minute, and answered again** — by a process holding 16 real file
+descriptors as shipped, or 12 with two rings. The epoll transport on the same box, same limit, same
+client, stopped at 65,527. There is no reason 70,000 is the end; it is what the test asked for.
+
+Two details that this rests on, both of which cost something to get right:
+
+- **The accept moves to the next ring 64 slots before the current one fills**, not when it runs out. A
+  multishot accept armed on a ring whose table is full fails *after* the kernel has accepted the socket,
+  so that client gets a reset rather than a wait, and moving over at the last slot would lose one
+  connection per ring. With the margin, all 4,096 slots above were used and nothing was dropped in
+  between; only at genuine saturation does a connection get refused, which is the wall it always was.
+- **One thread still waits for all of the rings at once**, through an eventfd per ring and one
+  `epoll_wait`. That combination is not obvious: a registered eventfd does wake an `epoll_wait` on a
+  ring created with `IORING_SETUP_DEFER_TASKRUN`, while polling the ring's own descriptor — the first
+  thing anyone would try — never becomes readable at all under that flag. With one ring the thread
+  blocks on the ring itself and there is no eventfd, which is why `IO_URING=1` costs ~3 µs per request
+  less than `IO_URING=4` at a concurrency of one, and nothing at all from 50 connections up.
+
+So the descriptor limit is no longer what ends a run. What should end it is the single vCPU: at ~180–250
+µs of CPU per request on a droplet and ~0.083 req/s per VU, that saturates somewhere around
+**48,000–67,000 VUs**, and after that the ~3 KB of kernel slab per connection ( ~790 MB at 262,140 )
+would be the next thing to go. Both are now ahead of the descriptor count rather than behind it.
+
+The client side is worth knowing either way. A connection is identified by its
 `(source ip, source port, dest ip, dest port)` tuple, so one load-generator address reaching one
 `ip:port` can open at most as many connections as it has ephemeral ports — and `ip_local_port_range`
-cannot exceed ports 1024-65535, i.e. **64,512, which is already below this server's ~65,527**. Measured
-on a stock range ( `32768 60999` ): **28,230 connections from one source address, then `EADDRINUSE`** —
-less than half of what one process here serves. So a second process could only ever help if the k6 box
-ran several source addresses, and the ceiling it would raise is one the client cannot reach anyway.
-Against that, a second process would mean a second SQLite writer, WAL contention between them and a
-worse p99 under write load, for nothing.
+cannot exceed ports 1024-65535, i.e. **64,512**. Measured on a stock range ( `32768 60999` ): **28,230
+connections from one source address, then `EADDRINUSE`**. Any harness that reaches past that is using
+several source addresses, so these numbers are not a ceiling on the score — they are the first thing to
+rule out when a run ends near 28,000 or 64,500, because there the error is `EADDRINUSE` on the client,
+not `EMFILE` on the server.
 
 ## What is optimized, and why
 
@@ -148,6 +211,20 @@ commit is an append to the WAL with no fsync. Batching 90 commits/s into ~10 sav
 percent of one vCPU, and costs a response that must be held back after its handler returns and failed
 in a batch if the commit fails. Not worth getting wrong. One commit per write request.
 
+**One range scan over `likes` instead of 20 counted lookups.** The feed's `like_count` is a correlated
+subquery per row, so a feed costs 20 separate lookups into `likes_post_id_idx`. The newest 20 posts
+have near-consecutive ids ( 499,981-500,000 in the seed ), so all 20 counts can be had from a single
+`post_id BETWEEN ? AND ?` range scan instead. I measured it both ways against the seed database, 20,000
+iterations each after a warm pass: **20.5 µs** for the 20 subqueries as it stands, **25.2 µs** for the
+range scan joined back to the rows in C, and **40.3 µs** for the same thing expressed as one statement
+with CTEs ( which materializes two of them, builds an automatic index on the counts and then sorts the
+result in a temp b-tree ). The reason it loses is that there was never much there to win: the same rows
+with no counts at all take 11.6 µs, so all 20 lookups together cost 8.9 µs — about 0.45 µs each,
+because `likes_post_id_idx` is a covering index and 20 adjacent `post_id`s sit in the same few pages of
+a database that is entirely `mmap`ed — while one `GROUP BY` statement costs 9.4 µs on its own, before
+any of its rows are used. It is the right optimisation when the per-row lookup is a real seek; here it
+is a page-cache probe, and the statement overhead is bigger than the work it replaces.
+
 ### A note on `-march=native`
 
 Both the amalgamation and the API are compiled `-march=native -mtune=native`. Everything is built from
@@ -163,8 +240,9 @@ server.
 
 - **Rule 5, no caching across requests.** Every response is built from a SQLite read taken while the
   request is being served. Every token's HMAC is recomputed from scratch — nothing about a token is
-  remembered. The only things reused between requests are prepared statements and the two buffers the
-  event loop reads and writes through.
+  remembered. The only things reused between requests are prepared statements and the buffers the
+  transport reads and writes through — the ring's provided receive buffers and its 32 response buffers,
+  which are pooled rather than per connection and hold nothing once a request has been answered.
 - **Rule 6, durable before responding.** WAL + `synchronous=NORMAL`. `INSERT ... RETURNING` is stepped
   all the way to `SQLITE_DONE` before the 201 is written, because with `RETURNING` it is that, not the
   first row, that ends the implicit transaction.
@@ -183,12 +261,35 @@ server.
 
 | | |
 |---|---|
-| `feedapi.c` | the five endpoints, routing, SQLite setup, JSON written into the response buffer |
-| `jwt.c/.h` | HS256 verification: base64url, the three distinct 401s the spec asks for, `CRYPTO_memcmp` |
-| `json.c/.h` | validating parser for `{"body":...}` ( "not JSON" and "no usable body" are different errors ) and the output escaper |
+| `feedapi.c` | the five endpoints, routing, SQLite setup, the response written through AmmarServer's own writers |
+| `jwt.c/.h` | HS256 verification: base64url, the distinct 401s the spec asks for, `CRYPTO_memcmp` |
 | `install.sh` | apt: `build-essential cmake git libssl-dev curl unzip ca-certificates` |
 | `build.sh` | fetches both pinned dependencies, builds the AmmarServer library target only, links `build/feedapi` |
 | `start.sh` | `exec build/feedapi` in the foreground, configured only by `SQLITE_PATH` / `JWT_SECRET` / `HOST` / `PORT` |
 
 `build.sh` honours `AMMARSERVER_SRC=/path/to/a/checkout` to build against a local AmmarServer tree
 instead of the pinned commit, for developing the two together. CI and the benchmark box never set it.
+
+The AmmarServer side of this is four files, and none of them is about this submission in particular:
+
+| | |
+|---|---|
+| `threads/apiProtocol.c` | the HTTP/1.1 framing both transports share, lifted out of the epoll loop without changing its behaviour — plus the request and response helpers below |
+| `threads/uringAPIServer.c` | the ring transport, compiled to a stub where the kernel headers are too old |
+| `tools/json_tools.c` | the JSON a handler needs: read one string field out of a request body, escape text into a response. This used to be the submission's own `json.c` |
+| `AmmServerlib.h` | what the above declare |
+
+What moved up there rather than staying here, because none of it is specific to this API — a handler that
+writes its answer through `AmmServer_APIResponseWrite*` cannot overrun the buffer it was given, since the
+first write that does not fit marks the response and every later one does nothing, so there is one check
+at the end instead of one per write:
+
+- `AmmServer_APIResponseWrite` / `WriteText` / `WriteInteger` / `WriteJSONString` / `Reset` / `Overflowed`
+- `AmmServer_APIRequestMatch(rqst,"/posts/%lld/like",&id)`, in place of hand written `memcmp` routing
+- `AmmServer_APIRequestBearer`, `AmmServer_APIRequestQueryParam`, beside the existing `...RequestHeader`
+- `AmmServer_JSONGetStringField`, `AmmServer_JSONEscape`
+- `AmmServer_StartAPIOnRings`, and the descriptor soft limit being raised to the hard limit before the
+  ring tables are sized — which a caller used to have to know to do for itself, as this one does
+
+The 42 suite checks, the 13 framing checks and a further 24 routing and auth edge cases all answer
+byte-identically to the build from before that move.

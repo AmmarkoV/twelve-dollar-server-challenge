@@ -7,10 +7,11 @@ BUILD="$HERE/build"
 mkdir -p "$BUILD"
 
 # AmmarServer, the HTTP server this submission is built on. Pinned by commit.
-# This commit has to be one that carries AmmServer_StartAPI / API mode ( src/AmmServerlib/threads/
-# epollAPIServer.c ) - without it the link below fails with an undefined reference to AmmServer_StartAPI.
+# This commit has to be one that carries API mode *and* its io_uring transport ( src/AmmServerlib/threads/
+# uringAPIServer.c , apiProtocol.c ) - without them the link below fails with an undefined reference to
+# AmmServer_StartAPIOnRings, which is what feedapi.c starts the server with.
 AMMARSERVER_REPO="https://github.com/AmmarkoV/AmmarServer.git"
-AMMARSERVER_COMMIT="b72898c19b2ec4f1024a5691cdb1d7369896bae6"
+AMMARSERVER_COMMIT="96f229c90f420ee6b18111c3ce1b39a29a8fc509"
 
 # SQLite, built from the amalgamation rather than taken from apt: it pins the version the benchmark runs
 # against, and it is the only way to get the compile-time options below ( most of all THREADSAFE=0 ).
@@ -43,12 +44,14 @@ else
 fi
 
 # Said plainly here rather than left to surface as an undefined reference at the link step below.
-if [ ! -f "$AMMARSERVER/src/AmmServerlib/threads/epollAPIServer.c" ]; then
-  echo "build.sh: this AmmarServer checkout has no API mode (src/AmmServerlib/threads/epollAPIServer.c)," >&2
-  echo "          which this submission is built on. AMMARSERVER_COMMIT=$AMMARSERVER_COMMIT needs to point" >&2
-  echo "          at a commit that carries it." >&2
-  exit 1
-fi
+for needed in epollAPIServer.c apiProtocol.c uringAPIServer.c; do
+  if [ ! -f "$AMMARSERVER/src/AmmServerlib/threads/$needed" ]; then
+    echo "build.sh: this AmmarServer checkout has no src/AmmServerlib/threads/$needed , which this" >&2
+    echo "          submission is built on ( API mode and its io_uring transport )." >&2
+    echo "          AMMARSERVER_COMMIT=$AMMARSERVER_COMMIT needs to point at a commit that carries it." >&2
+    exit 1
+  fi
+done
 
 # Only the AmmarServer library target, not the Services/ demo applications that ship alongside it.
 cmake -S "$AMMARSERVER" -B "$AMMARSERVER/build" -DCMAKE_BUILD_TYPE=Release > "$BUILD/cmake.log"
@@ -121,7 +124,7 @@ cc -O2 -DNDEBUG -Wall -march=native -mtune=native \
    -I"$SQLITE" \
    -I"$AMMARSERVER/src/AmmServerlib" \
    -o "$BUILD/feedapi" \
-   feedapi.c jwt.c json.c "$BUILD/sqlite3.o" \
+   feedapi.c jwt.c "$BUILD/sqlite3.o" \
    "${AMMARSERVER_LIBS[@]}" \
    -lcrypto -lpthread -lrt -lm
 

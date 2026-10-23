@@ -26,7 +26,6 @@
 
 #include "AmmServerlib.h"
 #include "jwt.h"
-#include "json.h"
 
 /* The feed is 20 posts of up to 500 characters. 500 C0 control characters escape to 6 bytes each, which is
  * the worst case a post body can reach, so 20 * ( 3000 + name + overhead ) has to fit with room to spare. */
@@ -50,65 +49,29 @@ static time_t serverStartTime = 0;
 
 /* --- writing the response ---------------------------------------------------------------------------- */
 
-struct Writer
-{
-   char * buf;
-   unsigned int size;
-   unsigned int used;
-   int overflowed;
-};
-
-#define PutLiteral(w,lit) Put((w),(lit),(unsigned int)(sizeof(lit)-1))
-
-static void Put(struct Writer * w,const char * s,unsigned int n)
-{
-  if (w->overflowed) { return; }
-  if (w->used+n > w->size) { w->overflowed=1; return; }
-  memcpy(w->buf+w->used,s,n);
-  w->used += n;
-}
-
-static void PutInteger(struct Writer * w,long long value)
-{
-  char digits[24];
-  int at=(int) sizeof(digits);
-  int negative = (value<0);
-  unsigned long long magnitude = negative ? (unsigned long long)(-value) : (unsigned long long) value;
-
-  if (magnitude==0) { digits[--at]='0'; }
-  while (magnitude>0) { digits[--at] = (char)('0'+(magnitude%10)); magnitude/=10; }
-  if (negative) { digits[--at]='-'; }
-
-  Put(w,digits+at,(unsigned int)((int) sizeof(digits)-at));
-}
-
-/* Text out of the database, which is raw bytes and has to be escaped to be JSON string content. */
-static void PutEscaped(struct Writer * w,const char * s,unsigned int n)
-{
-  if (w->overflowed) { return; }
-  if (n==0) { return; }
-
-  unsigned int written = JsonEscape(s,n,w->buf+w->used,w->size-w->used);
-  if (written==0) { w->overflowed=1; return; }
-  w->used += written;
-}
+/* Everything here answers through AmmarServer's own response writers ( AmmServer_APIResponseWrite* ) :
+ * they append into the body buffer the server handed the handler, bounds checked, and once a write has
+ * not fitted the response is marked overflowed and every later write does nothing. So a whole response
+ * can be written without checking each step and the buffer still cannot be overrun - the one check is at
+ * the end, with AmmServer_APIResponseOverflowed. The only thing added here is this macro, so that a
+ * literal's length still comes from sizeof rather than from strlen. */
+#define WriteLiteral(res,lit) AmmServer_APIResponseWrite((res),(lit),(unsigned int)(sizeof(lit)-1))
 
 static void Fail(struct AmmServer_APIResponse * res,unsigned int status,const char * message)
 {
-  struct Writer w = { res->body, res->maxBodyLength, 0, 0 };
-  PutLiteral(&w,"{\"error\":\"");
-  Put(&w,message,(unsigned int) strlen(message));
-  PutLiteral(&w,"\"}");
+  /* Throws away whatever had been written : this is called from halfway through building an answer. */
+  AmmServer_APIResponseReset(res,status,0);
 
-  res->statusCode = status;
-  res->bodyLength = w.used;
+  WriteLiteral(res,"{\"error\":\"");
+  AmmServer_APIResponseWriteText(res,message);
+  WriteLiteral(res,"\"}");
 }
 
 /* {"id":..,"body":..,"created_at":..,"author":..,"like_count":..} - the key order the spec fixes.
  * authorIsJsonEscaped is for the one case where the author came out of a JWT payload, where it is already
  * JSON string content and escaping it again would double its backslashes ( see jwt.h ). */
 static void PutPostObject(
-                           struct Writer * w,
+                           struct AmmServer_APIResponse * res,
                            long long id,
                            const char * body,unsigned int bodyLength,
                            const char * createdAt,unsigned int createdAtLength,
@@ -116,25 +79,26 @@ static void PutPostObject(
                            long long likeCount
                          )
 {
-  PutLiteral(w,"{\"id\":");
-  PutInteger(w,id);
-  PutLiteral(w,",\"body\":\"");
-  PutEscaped(w,body,bodyLength);
-  PutLiteral(w,"\",\"created_at\":\"");
+  WriteLiteral(res,"{\"id\":");
+  AmmServer_APIResponseWriteInteger(res,id);
+  WriteLiteral(res,",\"body\":\"");
+  AmmServer_APIResponseWriteJSONString(res,body,bodyLength);
+  WriteLiteral(res,"\",\"created_at\":\"");
   /* Stored in exactly the wire format the spec asks for, by the column default, so it goes out as stored. */
-  Put(w,createdAt,createdAtLength);
-  PutLiteral(w,"\",\"author\":\"");
-  if (authorIsJsonEscaped) { Put(w,author,authorLength); } else { PutEscaped(w,author,authorLength); }
-  PutLiteral(w,"\",\"like_count\":");
-  PutInteger(w,likeCount);
-  PutLiteral(w,"}");
+  AmmServer_APIResponseWrite(res,createdAt,createdAtLength);
+  WriteLiteral(res,"\",\"author\":\"");
+  if (authorIsJsonEscaped) { AmmServer_APIResponseWrite(res,author,authorLength); }
+  else                     { AmmServer_APIResponseWriteJSONString(res,author,authorLength); }
+  WriteLiteral(res,"\",\"like_count\":");
+  AmmServer_APIResponseWriteInteger(res,likeCount);
+  WriteLiteral(res,"}");
 }
 
 /* One row of the feed/post query, which both select the same five columns in the same order. */
-static void PutPostRow(struct Writer * w,sqlite3_stmt * stmt)
+static void PutPostRow(struct AmmServer_APIResponse * res,sqlite3_stmt * stmt)
 {
   PutPostObject(
-                 w,
+                 res,
                  sqlite3_column_int64(stmt,0),
                  (const char *) sqlite3_column_text(stmt,1),(unsigned int) sqlite3_column_bytes(stmt,1),
                  (const char *) sqlite3_column_text(stmt,2),(unsigned int) sqlite3_column_bytes(stmt,2),
@@ -144,23 +108,6 @@ static void PutPostRow(struct Writer * w,sqlite3_stmt * stmt)
 }
 
 /* --- request helpers -------------------------------------------------------------------------------- */
-
-static int ParsePositiveId(const char * s,unsigned int n,long long * out)
-{
-  if ( (n==0) || (n>18) ) { return 0; } /* 18 digits can never overflow a long long */
-
-  long long value=0;
-  unsigned int i=0;
-  for (i=0; i<n; i++)
-   {
-     if ( (s[i]<'0') || (s[i]>'9') ) { return 0; } /* rejects "abc" , "1.5" and "-1" alike */
-     value = (value*10) + (s[i]-'0');
-   }
-
-  if (value<=0) { return 0; } /* rejects "0" */
-  *out = value;
-  return 1;
-}
 
 /**
  * Verify the request's bearer token, answering with the right 401 if it does not hold up.
@@ -175,13 +122,16 @@ static int Authenticate(
                          unsigned int scratchSize
                        )
 {
-  unsigned int headerLength=0;
-  const char * header = AmmServer_APIRequestHeader(rqst,"Authorization",&headerLength);
+  unsigned int tokenLength=0;
+  const char * token = AmmServer_APIRequestBearer(rqst,&tokenLength);
 
-  switch ( JwtVerifyBearer(header,headerLength,jwtSecret,jwtSecretLength,(long long) time(0),claims,scratch,scratchSize) )
+  /* No Authorization header at all, or one whose scheme is not Bearer. A Bearer header with nothing after
+   * it comes back non-zero with length 0 instead, and is a broken credential rather than a missing one. */
+  if (token==0) { Fail(res,401,"missing bearer token"); return 0; }
+
+  switch ( JwtVerifyToken(token,tokenLength,jwtSecret,jwtSecretLength,(long long) time(0),claims,scratch,scratchSize) )
    {
      case JWT_OK          : return 1;
-     case JWT_NO_BEARER   : Fail(res,401,"missing bearer token");     return 0;
      case JWT_INVALID     : Fail(res,401,"invalid or expired token"); return 0;
      case JWT_BAD_PAYLOAD : Fail(res,401,"invalid token payload");    return 0;
    };
@@ -217,8 +167,6 @@ static unsigned int Utf8CharacterCount(const char * s,unsigned int n)
 
 static void ServeHealth(struct AmmServer_APIResponse * res)
 {
-  struct Writer w = { res->body, res->maxBodyLength, 0, 0 };
-
   /* The spec wants the ok answer to mean a SELECT 1 actually came back, so it is run per request. */
   int rc = SQLITE_ERROR;
   if (stmtPing!=0)
@@ -230,27 +178,23 @@ static void ServeHealth(struct AmmServer_APIResponse * res)
 
   if (rc!=SQLITE_ROW)
    {
-     PutLiteral(&w,"{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"");
      const char * message = (db!=0) ? sqlite3_errmsg(db) : "database is not open";
-     PutEscaped(&w,message,(unsigned int) strlen(message));
-     PutLiteral(&w,"\"}");
-     res->statusCode = 503;
-     res->bodyLength = w.used;
+     AmmServer_APIResponseReset(res,503,0);
+     WriteLiteral(res,"{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"");
+     AmmServer_APIResponseWriteJSONString(res,message,(unsigned int) strlen(message));
+     WriteLiteral(res,"\"}");
      return;
    }
 
-  PutLiteral(&w,"{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":");
-  PutInteger(&w,(long long)( time(0)-serverStartTime ));
-  PutLiteral(&w,"}");
-
   res->statusCode = 200;
-  res->bodyLength = w.used;
+  WriteLiteral(res,"{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":");
+  AmmServer_APIResponseWriteInteger(res,(long long)( time(0)-serverStartTime ));
+  WriteLiteral(res,"}");
 }
 
 static void ServeFeed(struct AmmServer_APIResponse * res)
 {
-  struct Writer w = { res->body, res->maxBodyLength, 0, 0 };
-  PutLiteral(&w,"{\"posts\":[");
+  WriteLiteral(res,"{\"posts\":[");
 
   sqlite3_reset(stmtFeed);
 
@@ -258,19 +202,18 @@ static void ServeFeed(struct AmmServer_APIResponse * res)
   int rc=0;
   while ( (rc=sqlite3_step(stmtFeed))==SQLITE_ROW )
    {
-     if (rows>0) { PutLiteral(&w,","); }
-     PutPostRow(&w,stmtFeed);
+     if (rows>0) { WriteLiteral(res,","); }
+     PutPostRow(res,stmtFeed);
      ++rows;
    }
   sqlite3_reset(stmtFeed);
 
   if (rc!=SQLITE_DONE) { Fail(res,500,"internal server error"); return; }
 
-  PutLiteral(&w,"]}");
-  if (w.overflowed) { Fail(res,500,"internal server error"); return; }
+  WriteLiteral(res,"]}");
+  if (AmmServer_APIResponseOverflowed(res)) { Fail(res,500,"internal server error"); return; }
 
   res->statusCode = 200;
-  res->bodyLength = w.used;
 }
 
 static void ServePost(struct AmmServer_APIResponse * res,long long postId)
@@ -283,17 +226,15 @@ static void ServePost(struct AmmServer_APIResponse * res,long long postId)
   if (rc==SQLITE_DONE) { sqlite3_reset(stmtPost); Fail(res,404,"post not found"); return; }
   if (rc!=SQLITE_ROW)  { sqlite3_reset(stmtPost); Fail(res,500,"internal server error"); return; }
 
-  struct Writer w = { res->body, res->maxBodyLength, 0, 0 };
-  PutLiteral(&w,"{\"post\":");
-  PutPostRow(&w,stmtPost);
-  PutLiteral(&w,"}");
+  WriteLiteral(res,"{\"post\":");
+  PutPostRow(res,stmtPost);
+  WriteLiteral(res,"}");
 
   sqlite3_reset(stmtPost);
 
-  if (w.overflowed) { Fail(res,500,"internal server error"); return; }
+  if (AmmServer_APIResponseOverflowed(res)) { Fail(res,500,"internal server error"); return; }
 
   res->statusCode = 200;
-  res->bodyLength = w.used;
 }
 
 static void CreatePost(struct AmmServer_APIRequest * rqst,struct AmmServer_APIResponse * res)
@@ -306,11 +247,11 @@ static void CreatePost(struct AmmServer_APIRequest * rqst,struct AmmServer_APIRe
   static char decodedBody[MAX_DECODED_BODY_SIZE+1];
   unsigned int decodedLength=0;
 
-  switch ( JsonGetStringField(rqst->body,rqst->bodyLength,"body",decodedBody,sizeof(decodedBody),&decodedLength) )
+  switch ( AmmServer_JSONGetStringField(rqst->body,rqst->bodyLength,"body",decodedBody,sizeof(decodedBody),&decodedLength) )
    {
-     case JSON_MALFORMED          : Fail(res,400,"malformed JSON body"); return;
-     case JSON_FIELD_NOT_A_STRING : Fail(res,400,"body is required");    return;
-     case JSON_FIELD_OK           : break;
+     case AMMSERVER_JSON_MALFORMED          : Fail(res,400,"malformed JSON body"); return;
+     case AMMSERVER_JSON_FIELD_NOT_A_STRING : Fail(res,400,"body is required");    return;
+     case AMMSERVER_JSON_FIELD_OK           : break;
    };
 
   /* Longer than the buffer means longer than any 500 character body could ever be. */
@@ -343,15 +284,13 @@ static void CreatePost(struct AmmServer_APIRequest * rqst,struct AmmServer_APIRe
   sqlite3_reset(stmtInsertPost);
   if (rc!=SQLITE_DONE) { Fail(res,500,"internal server error"); return; }
 
-  struct Writer w = { res->body, res->maxBodyLength, 0, 0 };
-  PutLiteral(&w,"{\"post\":");
-  PutPostObject(&w,newId,body,bodyLength,createdAt,createdAtLength,claims.username,claims.usernameLength,1,0);
-  PutLiteral(&w,"}");
+  WriteLiteral(res,"{\"post\":");
+  PutPostObject(res,newId,body,bodyLength,createdAt,createdAtLength,claims.username,claims.usernameLength,1,0);
+  WriteLiteral(res,"}");
 
-  if (w.overflowed) { Fail(res,500,"internal server error"); return; }
+  if (AmmServer_APIResponseOverflowed(res)) { Fail(res,500,"internal server error"); return; }
 
   res->statusCode = 201;
-  res->bodyLength = w.used;
 }
 
 static void LikePost(struct AmmServer_APIResponse * res,long long userId,long long postId)
@@ -376,15 +315,13 @@ static void LikePost(struct AmmServer_APIResponse * res,long long userId,long lo
 
   if (rc!=SQLITE_DONE) { Fail(res,500,"internal server error"); return; }
 
-  struct Writer w = { res->body, res->maxBodyLength, 0, 0 };
-  PutLiteral(&w,"{\"liked\":true,\"already_liked\":");
-  if (inserted) { PutLiteral(&w,"false"); } else { PutLiteral(&w,"true"); }
-  PutLiteral(&w,",\"post_id\":");
-  PutInteger(&w,postId);
-  PutLiteral(&w,"}");
+  WriteLiteral(res,"{\"liked\":true,\"already_liked\":");
+  if (inserted) { WriteLiteral(res,"false"); } else { WriteLiteral(res,"true"); }
+  WriteLiteral(res,",\"post_id\":");
+  AmmServer_APIResponseWriteInteger(res,postId);
+  WriteLiteral(res,"}");
 
   res->statusCode = inserted ? 201 : 200;
-  res->bodyLength = w.used;
 }
 
 /* --- routing ---------------------------------------------------------------------------------------- */
@@ -394,32 +331,36 @@ static void LikePost(struct AmmServer_APIResponse * res,long long userId,long lo
 #define LIKE_SUFFIX      "/like"
 #define LIKE_SUFFIX_LEN  5
 
+/* AmmServer_APIRequestMatch does the path matching for the two routes that carry an id : a template is the
+ * whole path or it is not a match, and %lld only matches a run of digits that is a positive number and
+ * cannot overflow, so "abc", "-1", "0" and "1.5" are not matches rather than ids parsed loosely.
+ *
+ * What it deliberately cannot say is "any path at all under this prefix", since every template is anchored
+ * at both ends - and the spec needs exactly that: /posts/<anything unusable> is a post request with a bad
+ * id and is answered 400, where a path that is not about posts at all is a 404. So the prefix tests below
+ * stay, and what they guard is the classification, not the routing. */
 static void HandleRequest(struct AmmServer_APIRequest * rqst,struct AmmServer_APIResponse * res)
 {
-  const char * path = rqst->path;
-  unsigned int pathLength = rqst->pathLength;
+  long long postId=0;
 
   if (rqst->method==GET)
    {
-     if (strcmp(path,"/feed")==0)   { ServeFeed(res);   return; }
-     if (strcmp(path,"/health")==0) { ServeHealth(res); return; }
+     if (AmmServer_APIRequestMatch(rqst,"/feed"))   { ServeFeed(res);   return; }
+     if (AmmServer_APIRequestMatch(rqst,"/health")) { ServeHealth(res); return; }
 
-     if ( (pathLength>POSTS_PREFIX_LEN) && (memcmp(path,POSTS_PREFIX,POSTS_PREFIX_LEN)==0) )
-      {
-        long long postId=0;
-        if (!ParsePositiveId(path+POSTS_PREFIX_LEN,pathLength-POSTS_PREFIX_LEN,&postId)) { Fail(res,400,"invalid post id"); return; }
-        ServePost(res,postId);
-        return;
-      }
+     if (AmmServer_APIRequestMatch(rqst,"/posts/%lld",&postId)) { ServePost(res,postId); return; }
+
+     if ( (rqst->pathLength>POSTS_PREFIX_LEN) && (memcmp(rqst->path,POSTS_PREFIX,POSTS_PREFIX_LEN)==0) )
+      { Fail(res,400,"invalid post id"); return; }
    }
   else
   if (rqst->method==POST)
    {
-     if (strcmp(path,"/posts")==0) { CreatePost(rqst,res); return; }
+     if (AmmServer_APIRequestMatch(rqst,"/posts")) { CreatePost(rqst,res); return; }
 
-     if ( (pathLength>POSTS_PREFIX_LEN+LIKE_SUFFIX_LEN) &&
-          (memcmp(path,POSTS_PREFIX,POSTS_PREFIX_LEN)==0) &&
-          (memcmp(path+pathLength-LIKE_SUFFIX_LEN,LIKE_SUFFIX,LIKE_SUFFIX_LEN)==0) )
+     if ( (rqst->pathLength>POSTS_PREFIX_LEN+LIKE_SUFFIX_LEN) &&
+          (memcmp(rqst->path,POSTS_PREFIX,POSTS_PREFIX_LEN)==0) &&
+          (memcmp(rqst->path+rqst->pathLength-LIKE_SUFFIX_LEN,LIKE_SUFFIX,LIKE_SUFFIX_LEN)==0) )
       {
         /* Auth before the id , which the spec is explicit about : POST /posts/abc/like without a token is a
          * 401 and only becomes a 400 once there is a valid one. */
@@ -427,9 +368,7 @@ static void HandleRequest(struct AmmServer_APIRequest * rqst,struct AmmServer_AP
         struct JwtClaims claims={0};
         if (!Authenticate(rqst,res,&claims,payloadScratch,sizeof(payloadScratch))) { return; }
 
-        long long postId=0;
-        unsigned int idLength = pathLength-POSTS_PREFIX_LEN-LIKE_SUFFIX_LEN;
-        if (!ParsePositiveId(path+POSTS_PREFIX_LEN,idLength,&postId)) { Fail(res,400,"invalid post id"); return; }
+        if (!AmmServer_APIRequestMatch(rqst,"/posts/%lld/like",&postId)) { Fail(res,400,"invalid post id"); return; }
 
         LikePost(res,claims.userId,postId);
         return;
@@ -570,7 +509,27 @@ int main(int argc,char *argv[])
   /* An empty config path , not 0 , so that AmmarServer's automatic lookup cannot pick up a stray
    * ammarServer.conf or /etc/ammarServer.conf and quietly change the port or the thread settings underneath
    * the benchmark. Everything this process needs comes from the environment variables above. */
-  struct AmmServer_Instance * instance = AmmServer_StartAPI("feedapi",host,port,"/dev/null",(void*) &HandleRequest,MAX_RESPONSE_SIZE);
+  /* Every connection is served from io_uring rather than from an epoll event loop, which means it lives as a
+   * direct descriptor inside a ring's own file table instead of as a file descriptor. A direct descriptor is
+   * not charged against RLIMIT_NOFILE, so the descriptor limit stops being the connection limit : a ring's
+   * table may be declared no larger than RLIMIT_NOFILE, but that is checked once per table, at registration,
+   * so RINGS tables hold RINGS times as many connections in this same single-threaded process. With
+   * LimitNOFILE=65535 that is a ceiling of 262,140 rather than 65,527. Measured : 70,000 concurrent
+   * connections, every one of them answered, in a process whose own descriptor limit was 65,535.
+   *
+   * The rings fill one at a time, so the second costs nothing until the first is full, and an idle ring costs
+   * one syscall a second. IO_URING=N asks for a different number of them, and IO_URING=0 asks for the epoll
+   * event loop instead - which is also where this lands by itself, with a line to say so, on a kernel that
+   * cannot give it a ring ( it needs 5.19 or newer ). Same handler, same SQLite, same three threads either
+   * way : only the transport underneath changes, which is what makes the two comparable. */
+  #define DEFAULT_RINGS 4
+  const char * useRing = getenv("IO_URING");
+  unsigned int wantRings = ( useRing!=0 ) ? (unsigned int) strtoul(useRing,0,10) : DEFAULT_RINGS;
+
+  struct AmmServer_Instance * instance =
+      ( wantRings>0 ) ?
+        AmmServer_StartAPIOnRings("feedapi",host,port,"/dev/null",(void*) &HandleRequest,MAX_RESPONSE_SIZE,wantRings) :
+        AmmServer_StartAPI("feedapi",host,port,"/dev/null",(void*) &HandleRequest,MAX_RESPONSE_SIZE);
   if (instance==0) { fprintf(stderr,"feedapi: could not start AmmarServer on %s:%u\n",host,port); return 1; }
 
   /* Every request is served on AmmarServer's event loop thread ; this one only has to stay out of its way. */
