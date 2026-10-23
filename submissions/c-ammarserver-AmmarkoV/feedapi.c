@@ -514,7 +514,7 @@ int main(int argc,char *argv[])
    * not charged against RLIMIT_NOFILE, so the descriptor limit stops being the connection limit : a ring's
    * table may be declared no larger than RLIMIT_NOFILE, but that is checked once per table, at registration,
    * so RINGS tables hold RINGS times as many connections in this same single-threaded process. With
-   * LimitNOFILE=65535 that is a ceiling of 262,140 rather than 65,527. Measured : 70,000 concurrent
+   * LimitNOFILE=65535 that is a ceiling of 393,210 rather than 65,527. Measured : 70,000 concurrent
    * connections, every one of them answered, in a process whose own descriptor limit was 65,535.
    *
    * The rings fill one at a time, so the second costs nothing until the first is full, and an idle ring costs
@@ -522,7 +522,7 @@ int main(int argc,char *argv[])
    * event loop instead - which is also where this lands by itself, with a line to say so, on a kernel that
    * cannot give it a ring ( it needs 5.19 or newer ). Same handler, same SQLite, same three threads either
    * way : only the transport underneath changes, which is what makes the two comparable. */
-  #define DEFAULT_RINGS 4
+  #define DEFAULT_RINGS 6
   const char * useRing = getenv("IO_URING");
   unsigned int wantRings = ( useRing!=0 ) ? (unsigned int) strtoul(useRing,0,10) : DEFAULT_RINGS;
 

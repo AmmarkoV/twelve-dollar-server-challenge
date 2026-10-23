@@ -7,14 +7,16 @@
 | **SQLite** | 3.53.0, built from the official amalgamation ( pinned URL + sha256 in `build.sh` ) and linked in, not the apt package |
 | **Crypto** | OpenSSL `libcrypto` ( `HMAC`, `CRYPTO_memcmp` ) for HS256 |
 | **Nginx or direct** | **Direct**, `0.0.0.0:80`. No Nginx |
-| **Transport** | `io_uring`, 4 rings, every connection a *direct descriptor* — so `LimitNOFILE=65535` is no longer the connection ceiling. `IO_URING=0` serves from the epoll event loop instead, which is also where it lands by itself on a kernel older than 5.19 |
+| **Transport** | `io_uring`, 6 rings, every connection a *direct descriptor* — so `LimitNOFILE=65535` is no longer the connection ceiling. `IO_URING=0` serves from the epoll event loop instead, which is also where it lands by itself on a kernel older than 5.19 |
 | **Threads** | 3, at any load: one event loop serving every connection, one acceptor, one idle `main` |
 
 ## Why direct, and what had to change to make it possible
 
-Each k6 VU sleeps 11–30 s per iteration and makes ~2.2 requests, so even 10,000 VUs is only about
-1,000 req/s. The scarce resource is not throughput, it is **concurrent connections**: ~15,000 of them,
-each nearly always idle. That is what decides the architecture.
+Each simulated user sleeps 11–30 s per iteration and makes ~2.2 requests, so even 10,000 users is only
+about 1,000 req/s. The scarce resource is not throughput, it is **concurrent connections**: ~15,000 of
+them, each nearly always idle. That is what decides the architecture. This round scores with **mload**,
+the Go implementation of the `bench/load.js` user model — one keep-alive connection per user, the same
+think times, the same 15% likes and 2% posts.
 
 AmmarServer was a thread-per-connection server with an epoll layer in front of `accept()` that held a
 connection thread-free only until its first byte arrived. That is the right design for its usual job —
@@ -42,27 +44,28 @@ there is no second process holding 15,000 sockets' worth of buffers.
 ## Measurements
 
 On my own machine, not the benchmark droplet, so read these as ratios and not as scores — a droplet
-vCPU is slower, and here k6 shares the CPU with the server:
+vCPU is slower, and here mload shares the CPU with the server:
 
 All of these were taken with the process's descriptor limit set to the droplet's `65535`, on what the
-submission ships ( 4 rings ):
+submission ships ( 6 rings ):
 
 | | |
 |---|---|
-| **70,000** idle keep-alive connections | 3 threads, **17.4 MB RSS**, **0 CPU ticks over a 60 s hold**, and **16 file descriptors** — the connections are not descriptors. Opened in 3.3 s, every one of the 70,000 answered byte-correct, then all 70,000 answered again after the hold |
-| `GET /feed`, existing keep-alive connection | avg **50 µs**, p50 48 µs, p99 65 µs idle — avg **59 µs** with 70,000 connections open |
-| `GET /health` / `GET /posts/:id`, same | avg **21 µs** / **22 µs** |
-| `POST /posts` sustained, one connection | **~5,500 writes/s**, p50 **88 µs**, p99 186 µs, worst 96 ms ( one WAL checkpoint ). Repeated runs vary by ±10% either way, and it is the WAL doing the varying, so read this as the order of magnitude it is |
-| `GET /feed` at 500 concurrent connections | **29,533 req/s** at 100% of one core, 33.9 µs of CPU per request |
-| k6, 2,000 VUs | p95 **300 µs**, p99 **401 µs**, 0.00% errors, 27,064/27,064 checks |
-| k6, 10,000 VUs | p95 **293 µs**, p99 **4.7 ms**, 0.00% errors, 183,547/183,547 checks, ~6% of one core |
+| **70,000** idle keep-alive connections | 3 threads, **17.7 MB RSS**, **1 CPU tick over a 60 s hold**, and **20 file descriptors** — the connections are not descriptors. Opened in 3.3 s, every one of the 70,000 answered byte-correct, then all 70,000 answered again after the hold |
+| `GET /feed`, existing keep-alive connection | avg **55 µs**, p50 55 µs, p99 84 µs idle — avg **62 µs** with 70,000 connections open |
+| `GET /health` / `GET /posts/:id`, same | avg **19 µs** / **27 µs** |
+| `POST /posts` sustained, one connection | **~5,500 writes/s**, p50 **74–93 µs**, p99 ~190 µs, worst 106–110 ms ( an auto-checkpoint ). Over 20,000 writes, twice, 4 and 7 of them stalled past 16 ms and ~150 past 1 ms. Repeated runs vary ±10% either way and it is the WAL doing the varying, so read the rate as the order of magnitude it is |
+| `GET /feed` at 500 concurrent connections | **27,000–29,500 req/s** at one full core, 35–36 µs of CPU per request. Six rings cost nothing against four and if anything help slightly: interleaved three times, 27,953 / 28,517 / 28,391 req/s on six against 27,276 / 27,115 / 27,507 on four |
+| mload, 2,000 users ( 60 s ramp, 5 min hold ) | p95 **219 µs**, p99 **289 µs**, 0.00% errors, 70,960/70,960 requests, ~1.8% of one core |
+| mload, 10,000 users ( 60 s ramp, 5 min hold ) | p95 **251 µs**, p99 **430 µs**, 0.00% errors, 354,196/354,196 requests, ~7.5% of one core |
 
 Per-request cost barely moving between 0 and 70,000 open connections is the property the whole design
 rests on, so it is the one worth checking first on the droplet.
 
-The two k6 rows were measured on the epoll transport, when that was what shipped, and I have not re-run
-them since — so read them as a floor rather than a figure: the ring was faster than epoll at every
-concurrency I measured afterwards. Everything else in the table is the ring as shipped.
+Every row in this table is the ring transport as shipped. The mload rows used mload at `8f02bc6` with
+the original `load.js` think times ( `-think-scale 1`, the default ) and no `-gzip`, because k6 does
+not send it; a separate 1,000-user `-gzip` run at ~2,000 req/s had zero errors, since compression is
+not implemented and the server ignores `Accept-Encoding`.
 
 ### Where the ceiling actually is
 
@@ -100,9 +103,10 @@ table. `RLIMIT_NOFILE` is never charged for it, and the size of the table become
 
 A table is where the multiplier comes from. It may be *declared* no larger than `RLIMIT_NOFILE`, but
 the kernel checks that once, at registration, and never again — so N tables are N times the connections
-from the same limit, in one process, on one thread, with one SQLite writer. That is why this ships four
-rings: **262,140 connection slots under `LimitNOFILE=65535`**. They fill one at a time, so the second
-ring costs nothing until the first is full, and an idle ring costs one syscall a second.
+from the same limit, in one process, on one thread, with one SQLite writer. That is why this ships six
+rings: **393,210 connection slots under `LimitNOFILE=65535`**. They fill one at a time, so the second
+ring costs nothing until the first is full, and an idle ring costs one syscall a second — six of them
+cost one CPU tick per minute while holding 70,000 connections, measured.
 
 Measured, with the server's hard limit lowered to 1024 so the whole ladder fits on one machine, every
 connection checked answered:
@@ -115,7 +119,7 @@ connection checked answered:
 | `io_uring`, 4 rings | **4,096** |
 
 And at the droplet's own limit: with `RLIMIT_NOFILE` at 65,535, **70,000 concurrent connections were
-opened, answered, held for a minute, and answered again** — by a process holding 16 real file
+opened, answered, held for a minute, and answered again** — by a process holding 20 real file
 descriptors as shipped, or 12 with two rings. The epoll transport on the same box, same limit, same
 client, stopped at 65,527. There is no reason 70,000 is the end; it is what the test asked for.
 
@@ -133,10 +137,12 @@ Two details that this rests on, both of which cost something to get right:
   blocks on the ring itself and there is no eventfd, which is why `IO_URING=1` costs ~3 µs per request
   less than `IO_URING=4` at a concurrency of one, and nothing at all from 50 connections up.
 
-So the descriptor limit is no longer what ends a run. What should end it is the single vCPU: at ~180–250
-µs of CPU per request on a droplet and ~0.083 req/s per VU, that saturates somewhere around
-**48,000–67,000 VUs**, and after that the ~3 KB of kernel slab per connection ( ~790 MB at 262,140 )
-would be the next thing to go. Both are now ahead of the descriptor count rather than behind it.
+So the descriptor limit is no longer what ends a run. What should end it is the single vCPU. The honest way to size that is
+per user rather than per request: this cost ~7.5 µs of CPU per second per simulated user in the
+10,000-user mload hold, so one core is ~133,000 users here, and a droplet vCPU being 1.5–2x slower puts
+it somewhere around **66,000–89,000**. Kernel memory is further out still: 3.07 kB of unreclaimable slab
+per connection, measured over 70,000 of them, so 2 GB does not become the wall until roughly 450,000. Both
+are now ahead of the descriptor count instead of behind it.
 
 The client side is worth knowing either way. A connection is identified by its
 `(source ip, source port, dest ip, dest port)` tuple, so one load-generator address reaching one
@@ -206,8 +212,8 @@ is no Nginx.
 ### What I left out, deliberately
 
 **Group commit.** Batching several requests' writes into one transaction is allowed ( rule 6 ), but at
-10,000 VUs only ~8% of requests are writes — about 90 commits/s — and with WAL + `synchronous=NORMAL` a
-commit is an append to the WAL with no fsync. Batching 90 commits/s into ~10 saves a fraction of a
+10,000 users only ~8% of requests are writes — about 80 commits/s — and with WAL + `synchronous=NORMAL` a
+commit is an append to the WAL with no fsync. Batching 80 commits/s into ~10 saves a fraction of a
 percent of one vCPU, and costs a response that must be held back after its handler returns and failed
 in a batch if the commit fails. Not worth getting wrong. One commit per write request.
 

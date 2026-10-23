@@ -11,7 +11,7 @@ mkdir -p "$BUILD"
 # uringAPIServer.c , apiProtocol.c ) - without them the link below fails with an undefined reference to
 # AmmServer_StartAPIOnRings, which is what feedapi.c starts the server with.
 AMMARSERVER_REPO="https://github.com/AmmarkoV/AmmarServer.git"
-AMMARSERVER_COMMIT="96f229c90f420ee6b18111c3ce1b39a29a8fc509"
+AMMARSERVER_COMMIT="a5b9a982457b80974c9f8eba1391be6bbfa8316b"
 
 # SQLite, built from the amalgamation rather than taken from apt: it pins the version the benchmark runs
 # against, and it is the only way to get the compile-time options below ( most of all THREADSAFE=0 ).
