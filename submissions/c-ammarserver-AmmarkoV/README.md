@@ -56,11 +56,23 @@ submission ships ( 6 rings ):
 | `GET /health` / `GET /posts/:id`, same | avg **19 µs** / **27 µs** |
 | `POST /posts` sustained, one connection | **~5,500 writes/s**, p50 **74–93 µs**, p99 ~190 µs, worst 106–110 ms ( an auto-checkpoint ). Over 20,000 writes, twice, 4 and 7 of them stalled past 16 ms and ~150 past 1 ms. Repeated runs vary ±10% either way and it is the WAL doing the varying, so read the rate as the order of magnitude it is |
 | `GET /feed` at 500 concurrent connections | **27,000–29,500 req/s** at one full core, 35–36 µs of CPU per request. Six rings cost nothing against four and if anything help slightly: interleaved three times, 27,953 / 28,517 / 28,391 req/s on six against 27,276 / 27,115 / 27,507 on four |
+| the same against **one** ring | also nothing. Interleaved four times at saturation, **56.3 µs** of CPU per request on six rings against **56.8 µs** on one — so the `epoll_wait` + `read(eventfd)` + `io_uring_enter` that several rings make the thread wait through does not show up against the single `io_uring_enter` one ring blocks on. Six rings are therefore free, and they are what lifts the connection ceiling |
 | mload, 2,000 users ( 60 s ramp, 5 min hold ) | p95 **219 µs**, p99 **289 µs**, 0.00% errors, 70,960/70,960 requests, ~1.8% of one core |
 | mload, 10,000 users ( 60 s ramp, 5 min hold ) | p95 **251 µs**, p99 **430 µs**, 0.00% errors, 354,196/354,196 requests, ~7.5% of one core |
+| mload, 60,000 users | **0.000% errors**, 5,817–5,822 req/s, p95 **9.8–10.8 ms**, p99 **29.5–30.7 ms**, ~36% of one core, 60 MB RSS. Before the receive-buffer fix below the same run lost **2,700–3,300 requests to the 60 s timeout** every time, at 0.40–0.49% |
+| mload, 100,000 users | **0.000% errors**, 9,203 req/s, p95 **28 ms**, p99 **34 ms**, **57% of one core**, 68 MB RSS |
 
 Per-request cost barely moving between 0 and 70,000 open connections is the property the whole design
 rests on, so it is the one worth checking first on the droplet.
+
+The 60,000 and 100,000 user rows ran with a 30–45 s ramp and a 90 s hold, the server under `taskset -c 0`
+so that it has the droplet's one vCPU, and mload on the other fifteen cores with its users spread over
+eight loopback addresses — below about 25,000 users against a single address the generator runs out of
+ephemeral ports before the server runs out of anything. Server CPU is read from the second half of the
+samples, because the ramp otherwise drags the figure down by about a third. **150,000 users is past what
+this box can measure**: mload itself falls behind there ( 13,568 req/s against the ~15,900 that many users
+should ask for, p95 820 ms ) while the server is still only at 60% of its core, so that number says
+something about the generator and nothing about the submission.
 
 Every row in this table is the ring transport as shipped. The mload rows used mload at `8f02bc6` with
 the original `load.js` think times ( `-think-scale 1`, the default ) and no `-gzip`, because k6 does
@@ -208,6 +220,58 @@ AND 500` and SQLite's `length()` counts characters, so counting bytes would reje
 **No per-request logging.** API mode never touches the access/error logs; AmmarServer writes one
 startup line and nothing after it. Nginx's log would have had the same information anyway, and there
 is no Nginx.
+
+**The HS256 key schedule is prepared once.** HMAC pads the key out to a 64 byte block and hashes
+`ipad||message`, then `opad||inner`. The first block of each of those two hashes depends on the key
+alone, so it is the same block for every token this server will ever see — and OpenSSL's one-shot
+`HMAC()` re-derives both of them, and on OpenSSL 3 fetches the MAC out of the provider as well, on
+every single call. The two SHA-256 states are now built once and copied per token with
+`EVP_MD_CTX_copy_ex`: **1.48 µs a token down to 0.25 µs**, measured over 200,000 tokens, byte-identical
+output. Rule 5 is untouched — every signature is still computed over the bytes that arrived and compared
+in full with `CRYPTO_memcmp`; what is kept is the *key's* schedule, which is the same kind of thing a
+prepared statement keeps about a query. It is worth saying how small this is in the score: `GET /feed`
+and `GET /posts/:id` carry no token, so only the ~8% of mload's requests that write ever verify one, and
+1.2 µs of those is about **0.1 µs of an average request**. It is free and it is strictly better, but it
+is not what moves the number.
+
+### The receive-buffer stall, which is what actually moved the number
+
+At 60,000 users the shipped build dropped **2,700–3,300 requests per run to the 60 s client timeout**,
+reproducibly, while using 34% of its one core. Nothing was saturated: it was a lost-wakeup bug in the
+ring transport.
+
+A connection's receive is a *multishot* `IORING_OP_RECV` reading into whichever provided buffer is free
+when bytes turn up, which is what makes an idle connection cost nothing but its struct. When every
+provided buffer is momentarily in hand, that multishot receive completes with `-ENOBUFS` and is **not**
+re-armed — correctly, because there is nothing to re-arm it into. The transport noted that and returned.
+But a connection in that state has *nothing outstanding on it at all*: no completion will ever arrive
+for it again, so nothing would ever notice it needed arming. It was not slow, it was gone, until its
+client gave up a minute later. The same silent dead end existed when `ArmRecv` could not get a
+submission queue entry.
+
+The fix is the queue the send tickets already had: a connection that could not have its receive armed
+waits in a per-ring list, and `RecycleRecvBuffer` arms **one** of them each time a buffer comes back.
+One re-arm per returned buffer is what keeps it from spinning — a connection that finds the buffer
+already taken simply queues again, and the next attempt waits for the next buffer, which waits for a
+request to be served. Closing stays constant time: a connection that closed while queued is skipped
+when it comes up rather than unlinked. Slot reuse had to stop clearing the queue links for the same
+reason, or a slot that came back into use while queued would cut the queue in two and strand everything
+behind it — which the send-ticket queue had been exposed to as well.
+
+Measured, interleaved, two rounds each at 60,000 users:
+
+| | errors | req/s |
+|---|---|---|
+| as it shipped | 0.40–0.49% , all of them 60 s timeouts | 5,553 / 5,578 |
+| the re-arm fix, pool left exactly as it was | **0.000%** | 5,817 / 5,822 |
+| the re-arm fix and an eight times larger pool | **0.000%** | 5,819 / 5,820 |
+
+The third row is the one worth reading twice: **enlarging the buffer pool was not the fix and is not
+shipped.** It was the first thing that made the timeouts go away, which is exactly why it was worth
+testing on its own — the pool had only hidden the bug, and the bug was still there to be hit by any
+burst large enough. The re-arm costs nothing and 1,024 buffers is what ships. Throughput going *up* by
+5% is the requests that used to be dropped now being answered; p95 rises with it, from 5.2 ms to 9.8 ms,
+for the same reason, and that is the honest direction for it to move.
 
 ### What I left out, deliberately
 

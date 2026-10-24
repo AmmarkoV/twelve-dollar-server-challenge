@@ -6,6 +6,76 @@
 
 #include "jwt.h"
 
+/* --- HS256 with the key's schedule prepared once -----------------------------------------------------
+ * HMAC pads the key out to a 64 byte block and hashes ipad||message , then opad||inner . The first block
+ * of each of those two hashes depends on the key alone, so it is the same block for every token this
+ * server will ever see. It is hashed here the first time a secret turns up and the two SHA-256 states are
+ * copied per token after that, which is the whole of the saving : OpenSSL's one-shot HMAC() re-derives
+ * them, and on OpenSSL 3 also fetches the MAC out of the provider, every single call.
+ * Nothing about a *token* is remembered - every signature is still computed over the bytes that arrived
+ * and compared in full ( rule 5 ). This is the key's schedule, the same kind of thing a prepared
+ * statement caches about a query.
+ * The handler runs on one thread ( see epollAPIServer.h ), so these need no locking. */
+static EVP_MD_CTX * hmacAfterIpad = 0;
+static EVP_MD_CTX * hmacAfterOpad = 0;
+static EVP_MD_CTX * hmacWork      = 0;
+static unsigned char * hmacSecret = 0;
+static unsigned int    hmacSecretLength = 0;
+
+/* @retval 1=the two states above are ready for this secret , 0=OpenSSL would not play along */
+static int HmacPrepare(const char * secret,unsigned int secretLength)
+{
+  if ( (hmacSecret!=0) && (secretLength==hmacSecretLength) && (memcmp(hmacSecret,secret,secretLength)==0) ) { return 1; }
+
+  unsigned char block[64]; memset(block,0,sizeof(block));
+  if (secretLength>sizeof(block))
+   {
+     unsigned int digestLength=0;
+     if (!EVP_Digest(secret,secretLength,block,&digestLength,EVP_sha256(),0)) { return 0; }
+   }
+  else { memcpy(block,secret,secretLength); }
+
+  unsigned char ipad[64],opad[64];
+  unsigned int i=0;
+  for (i=0; i<sizeof(block); i++) { ipad[i]=block[i]^0x36; opad[i]=block[i]^0x5C; }
+
+  if (hmacAfterIpad==0) { hmacAfterIpad=EVP_MD_CTX_new(); }
+  if (hmacAfterOpad==0) { hmacAfterOpad=EVP_MD_CTX_new(); }
+  if (hmacWork==0)      { hmacWork     =EVP_MD_CTX_new(); }
+  if ( (hmacAfterIpad==0) || (hmacAfterOpad==0) || (hmacWork==0) ) { return 0; }
+
+  if (!EVP_DigestInit_ex(hmacAfterIpad,EVP_sha256(),0)) { return 0; }
+  if (!EVP_DigestUpdate(hmacAfterIpad,ipad,sizeof(ipad))) { return 0; }
+  if (!EVP_DigestInit_ex(hmacAfterOpad,EVP_sha256(),0)) { return 0; }
+  if (!EVP_DigestUpdate(hmacAfterOpad,opad,sizeof(opad))) { return 0; }
+
+  unsigned char * kept = (unsigned char *) realloc(hmacSecret,(secretLength!=0)?secretLength:1);
+  if (kept==0) { return 0; }
+  memcpy(kept,secret,secretLength);
+  hmacSecret = kept;
+  hmacSecretLength = secretLength;
+  return 1;
+}
+
+/* @retval 1=signature written to out , 0=failed */
+static int HmacSha256(const char * secret,unsigned int secretLength,const unsigned char * message,unsigned int messageLength,unsigned char out[32])
+{
+  if (!HmacPrepare(secret,secretLength)) { return 0; }
+
+  unsigned char inner[32];
+  unsigned int length=0;
+
+  if (!EVP_MD_CTX_copy_ex(hmacWork,hmacAfterIpad)) { return 0; }
+  if (!EVP_DigestUpdate(hmacWork,message,messageLength)) { return 0; }
+  if (!EVP_DigestFinal_ex(hmacWork,inner,&length)) { return 0; }
+
+  if (!EVP_MD_CTX_copy_ex(hmacWork,hmacAfterOpad)) { return 0; }
+  if (!EVP_DigestUpdate(hmacWork,inner,sizeof(inner))) { return 0; }
+  if (!EVP_DigestFinal_ex(hmacWork,out,&length)) { return 0; }
+
+  return (length==32);
+}
+
 /* base64url alphabet as a reverse lookup, 0xFF = not a base64url character. Built once on first use ; the
  * API handler this is called from runs on a single thread ( see epollAPIServer.h ), so there is no race to
  * protect against here. */
@@ -188,11 +258,9 @@ enum JwtResult JwtVerifyToken(
   int expectedSignatureLength = Base64UrlDecode(signatureB64,signatureB64Length,expectedSignature,sizeof(expectedSignature));
   if (expectedSignatureLength!=32) { return JWT_INVALID; }
 
-  unsigned char computedSignature[EVP_MAX_MD_SIZE];
-  unsigned int computedSignatureLength=0;
+  unsigned char computedSignature[32];
   unsigned int signedLength = headerB64Length+1+payloadB64Length;
-  if (HMAC(EVP_sha256(),secret,(int) secretLength,(const unsigned char*) headerB64,signedLength,computedSignature,&computedSignatureLength)==0) { return JWT_INVALID; }
-  if (computedSignatureLength!=32) { return JWT_INVALID; }
+  if (!HmacSha256(secret,secretLength,(const unsigned char*) headerB64,signedLength,computedSignature)) { return JWT_INVALID; }
 
   if (CRYPTO_memcmp(computedSignature,expectedSignature,32)!=0) { return JWT_INVALID; }
 
