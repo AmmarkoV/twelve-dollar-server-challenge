@@ -165,6 +165,71 @@ several source addresses, so these numbers are not a ceiling on the score — th
 rule out when a run ends near 28,000 or 64,500, because there the error is `EADDRINUSE` on the client,
 not `EMFILE` on the server.
 
+## Expected performance on the droplet
+
+Everything above was measured on a 16-core machine with mload sharing it, so none of it is a score. What
+carries over is the cost per unit of work, and that turned out to be the same figure at both of the loads
+worth believing:
+
+| | req/s | server CPU | µs of CPU per request |
+|---|---|---|---|
+| mload, 60,000 users | 5,820 | 36% of one core | **61.9** |
+| mload, 100,000 users | 9,203 | 57% of one core | **61.9** |
+
+Two loads a factor of 1.7 apart agreeing to three digits is what makes the extrapolation worth writing
+down at all. Scaling it by a droplet vCPU being 1.5–2x slower than a core here:
+
+| | measured here | expected on the droplet |
+|---|---|---|
+| CPU per request | **62 µs** | 93–124 µs |
+| CPU per user per second | 6.6–7.5 µs | 10–15 µs |
+| requests/s at one full core | ~16,100 | **8,000–10,800** |
+| users at one full core, `-think-scale 1` | ~133,000–150,000 | **66,000–100,000** |
+| RSS at 100,000 connections | 68 MB | the same — memory does not care how fast the core is |
+
+So the expectation is **somewhere between 66,000 and 100,000 users**, and the honest width of that range
+is the 1.5–2x guess about the vCPU, not anything about the server. The two ends come from the two ways of
+dividing the same runs: 7.5 µs of CPU per user per second in the 10,000 user hold, which is the figure the
+section above uses, and 6.6 µs in the 100,000 user one — fixed per-user cost matters less the busier the
+core is, which is why the top end here is higher than the 89,000 quoted up there.
+
+Latency should stay unremarkable until the core does. Here p99 was **430 µs** at 10,000 users with the
+core 7.5% busy, and **30 ms** at 60,000 with it 36% busy — queueing, not work. On the droplet the same
+user counts put the core at roughly 11–15% and 54–72%, so expect p99 in the low milliseconds up to about
+20,000 users and in the tens of milliseconds past 50,000, with the knee wherever the core actually runs
+out. The 60 s client timeout should not be reached at all: the run that used to reach it was the
+receive-buffer stall below, not load.
+
+The walls arrive in this order, which is the point of the section above:
+
+1. **The single vCPU**, at 66,000–100,000 users.
+2. **Kernel memory**, at roughly 450,000 connections — 3.07 kB of unreclaimable slab each, measured over
+   70,000 of them, against 2 GB.
+3. **Descriptors are not a wall any more**: 393,210 direct-descriptor slots under `LimitNOFILE=65535`.
+
+What would make the droplet miss the low end of that range is not throughput but the WAL. `POST /posts`
+is ~8% of mload's requests and an auto-checkpoint already costs 106–110 ms here on an NVMe SSD; on
+droplet storage that is the one number I would expect to be worse than a straight 1.5–2x, and it lands
+on p99 rather than on the user count.
+
+### On a machine with more cores
+
+It would not go faster, and that is a choice rather than a limit: the transport is **one thread** for all
+six rings, because the box this is written for has one vCPU and a thread pool there would only add
+context switches, locking, and a second SQLite writer to serialise against the first. On 16 cores,
+fifteen of them would idle and the ceiling above would not move.
+
+The same 62 µs per request says what threading it would be worth: 16 cores is ~258,000 req/s in theory,
+and at the 60–70% that one SQLite writer, softirq and memory bandwidth would realistically leave, about
+**1.5–1.7 million users** at these think times. Reaching that is three changes — a ring set and an
+`io_uring` thread per core ( `IORING_SETUP_SINGLE_ISSUER` is per ring, so this is the natural shape ),
+the HS256 key schedule made thread-local instead of a bare global, and something better than one writer
+for `POST`. None of them belong in a submission for a one-vCPU box, so none of them are here. The challenge
+author's own sibling [Million Users Challenge](https://github.com/arjaythedev/million-users-challenge) is
+where that version would go, and the arithmetic is inviting — a million users there is only ~42,400
+req/s, about 2.6 cores of the 16 at this cost per request — but it asks for Postgres on another machine
+instead of in-process SQLite, which changes the per-request cost this whole section is built on.
+
 ## What is optimized, and why
 
 **One thread, no locks anywhere.** The box has one vCPU, so a thread pool would only add context
